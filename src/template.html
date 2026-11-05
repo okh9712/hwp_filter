@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HWP 문항 필터</title>
+<style>
+:root{
+  --bg:#f6f7f9; --card:#fff; --ink:#1c2330; --muted:#667085; --line:#e3e6ec;
+  --accent:#2457d6; --accent-ink:#fff; --accent-soft:#e8eefc; --ok:#12805c; --warn:#b54708; --danger:#c0362c;
+  --chip:#fff; --chip-on:#2457d6;
+}
+@media (prefers-color-scheme: dark){
+  :root{ --bg:#12151b; --card:#1a1f28; --ink:#e8ebf1; --muted:#9aa4b5; --line:#2b3240;
+    --accent:#6b93ff; --accent-ink:#0c1226; --accent-soft:#222c47; --ok:#48c79b; --warn:#f0a65a; --danger:#ff7b70;
+    --chip:#1a1f28; --chip-on:#6b93ff; }
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 "Pretendard","Malgun Gothic","Apple SD Gothic Neo",system-ui,sans-serif}
+main{max-width:860px;margin:0 auto;padding:28px 16px 64px}
+h1{font-size:22px;margin:0 0 4px;letter-spacing:-.01em}
+.sub{color:var(--muted);margin:0 0 22px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px 18px 16px;margin-bottom:14px}
+.card h2{font-size:15px;margin:0 0 12px;display:flex;align-items:center;gap:8px}
+.step{display:inline-grid;place-items:center;width:22px;height:22px;border-radius:50%;background:var(--accent);color:var(--accent-ink);font-size:12px;font-weight:700}
+#drop{border:2px dashed var(--line);border-radius:10px;padding:30px 16px;text-align:center;cursor:pointer;color:var(--muted);transition:.15s}
+#drop:hover,#drop.over{border-color:var(--accent);background:var(--accent-soft);color:var(--ink)}
+#drop strong{color:var(--ink)}
+#drop:focus-visible,button:focus-visible,input:focus-visible,summary:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.fileinfo{margin-top:12px;color:var(--muted);font-size:13.5px}
+.fileinfo b{color:var(--ink)}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.row+.row{margin-top:10px}
+input[type=text]{flex:1;min-width:180px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--ink);font:inherit}
+button{font:inherit;border:1px solid var(--line);background:var(--card);color:var(--ink);padding:7px 12px;border-radius:8px;cursor:pointer}
+button:hover:not(:disabled){border-color:var(--accent)}
+button:disabled{opacity:.45;cursor:not-allowed}
+button.primary{background:var(--accent);color:var(--accent-ink);border-color:var(--accent);font-weight:700;padding:11px 22px;font-size:16px}
+.chips{display:flex;flex-wrap:wrap;gap:7px}
+.chip{display:inline-flex;align-items:baseline;gap:5px;padding:6px 11px;border-radius:999px;background:var(--chip);border:1px solid var(--line);cursor:pointer;user-select:none;font-variant-numeric:tabular-nums}
+.chip small{color:var(--muted);font-size:12px}
+.chip[aria-pressed=true]{background:var(--chip-on);border-color:var(--chip-on);color:var(--accent-ink)}
+.chip[aria-pressed=true] small{color:inherit;opacity:.85}
+.group-label{font-size:12.5px;color:var(--muted);margin:14px 0 7px}
+.group-label:first-of-type{margin-top:0}
+label.opt{display:flex;gap:8px;align-items:center;cursor:pointer}
+.notice{font-size:13.5px;margin-top:8px;color:var(--warn)}
+.summary{display:flex;flex-wrap:wrap;gap:14px;align-items:center;justify-content:space-between}
+.summary .num{font-size:19px;font-weight:700;font-variant-numeric:tabular-nums}
+.summary .num span{color:var(--muted);font-size:14px;font-weight:400}
+.status{margin-top:12px;font-size:14px}
+.status.ok{color:var(--ok)} .status.err{color:var(--danger)}
+details summary{cursor:pointer;color:var(--muted);font-size:14px}
+.tbl{max-height:380px;overflow:auto;margin-top:10px;border:1px solid var(--line);border-radius:8px}
+table{border-collapse:collapse;width:100%;font-size:13px}
+th,td{padding:6px 9px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top}
+th{position:sticky;top:0;background:var(--card);color:var(--muted);font-weight:600}
+td.n{white-space:nowrap;font-variant-numeric:tabular-nums}
+tr.drop-row{opacity:.45}
+.tag-keep{color:var(--ok);font-weight:600}.tag-del{color:var(--muted)}
+#preview{width:100%;height:520px;margin-top:10px;border:1px solid var(--line);border-radius:8px;background:#fff}
+.hidden{display:none!important}
+.foot{color:var(--muted);font-size:12.5px;margin-top:18px;line-height:1.6}
+.foot code{background:var(--accent-soft);padding:1px 5px;border-radius:4px}
+</style>
+</head>
+<body>
+<main>
+  <h1>HWP 문항 필터</h1>
+  <p class="sub">HWP 파일을 올리고 남길 문항 번호를 고르면, 나머지 문항을 삭제한 새 HWP 파일을 만들어 줍니다.
+     모든 처리는 이 브라우저 안에서만 이루어지며 파일이 외부로 전송되지 않습니다.</p>
+
+  <section class="card">
+    <h2><span class="step">1</span>HWP 파일 올리기</h2>
+    <div id="drop" tabindex="0" role="button" aria-label="HWP 파일 선택">
+      <div><strong>여기로 파일을 끌어다 놓거나 클릭해서 선택</strong></div>
+      <div style="margin-top:4px;font-size:13px">.hwp (한글 5.x 형식)</div>
+    </div>
+    <input id="file" type="file" accept=".hwp" class="hidden">
+    <div id="fileinfo" class="fileinfo hidden"></div>
+    <div id="loaderr" class="status err hidden"></div>
+  </section>
+
+  <div id="work" class="hidden">
+    <section class="card">
+      <h2><span class="step">2</span>남길 문항 번호 선택</h2>
+      <div class="row">
+        <input id="range" type="text" placeholder="예) 19-45   또는   19-25, 29, 35-41, 학교프린트" aria-label="번호 범위 입력">
+        <button id="applyRange" type="button">입력한 번호로 선택</button>
+      </div>
+      <div class="row">
+        <button id="selAll" type="button">전체 선택</button>
+        <button id="selNone" type="button">전체 해제</button>
+        <button id="selInv" type="button">선택 반전</button>
+      </div>
+      <div id="rangeNotice" class="notice hidden"></div>
+
+      <div class="group-label" style="margin-top:16px">문항 번호 (괄호 안은 해당 번호의 문항 수)</div>
+      <div id="numChips" class="chips"></div>
+      <div id="labelWrap" class="hidden">
+        <div class="group-label">번호 없는 구분</div>
+        <div id="labelChips" class="chips"></div>
+      </div>
+
+      <div class="row" style="margin-top:16px">
+        <label class="opt"><input id="optVariant" type="checkbox" checked> <span>“변형” 표시가 붙은 문항도 함께 남기기</span></label>
+      </div>
+      <div class="row">
+        <label class="opt"><input id="optRenum" type="checkbox" checked> <span>남긴 문항 앞에 <b>1번부터 새 번호</b> 달기 (맨 뒤 정답 번호도 자동 연동)</span></label>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2><span class="step">3</span>실행</h2>
+      <div class="summary">
+        <div class="num" id="sumText"></div>
+        <div class="row">
+          <button id="run" class="primary" type="button" disabled>실행 · HWP 저장</button>
+          <button id="runPdf" class="primary" type="button" disabled>PDF로 저장</button>
+        </div>
+      </div>
+      <div class="foot" style="margin-top:10px">PDF는 남긴 문항의 <b>텍스트만</b> A4 2단으로 정리해 인쇄 창을 엽니다. 대상을 “PDF로 저장”으로 선택하세요. 그림·표·수식은 “[그림/표 생략]”으로 표시되며 원본 서식은 재현되지 않습니다. 원본 그대로의 PDF가 필요하면 저장된 HWP를 한글에서 열어 PDF로 저장하세요.</div>
+      <div id="status" class="status hidden" role="status"></div>
+    </section>
+
+    <section class="card">
+      <details id="prevWrap" open>
+        <summary>미리보기 (남기는 문항 · 선택 변경 시 자동 갱신)</summary>
+        <div id="prevEmpty" class="foot">번호를 선택하면 여기에 결과가 표시됩니다.</div>
+        <iframe id="preview" title="미리보기" class="hidden"></iframe>
+        <div class="foot">텍스트 기준 미리보기입니다. 그림·표·수식은 “[그림/표 생략]”으로 표시되며, 실제 HWP에는 원본 그대로 남습니다.</div>
+      </details>
+    </section>
+
+    <section class="card">
+      <details>
+        <summary>문항 목록 확인 (태그가 어떻게 인식됐는지 점검)</summary>
+        <div class="tbl"><table>
+          <thead><tr><th>상태</th><th>구분</th><th>문항 수</th><th>첫 문단</th></tr></thead>
+          <tbody id="blockRows"></tbody>
+        </table></div>
+      </details>
+    </section>
+  </div>
+
+  <p class="foot">
+    인식 규칙: 발문 끝의 <code>[25년 10월 19번]</code> 같은 태그를 기준으로 문항을 나눕니다.
+    태그가 없는 <code>윗글의 …</code> 같은 후속 문항은 바로 앞 문항(묶음 지문)과 함께 남기거나 삭제됩니다.
+    <code>41~42번</code>처럼 여러 번호가 묶인 문항은 그중 하나만 선택해도 남습니다.
+  </p>
+</main>
+
+<script>/*__VENDOR_CFB__*/</script>
+<script>/*__VENDOR_FFLATE__*/</script>
+<script>/*__CORE__*/</script>
+<script>/*__APP__*/</script>
+</body>
+</html>
