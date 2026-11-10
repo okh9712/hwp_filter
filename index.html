@@ -107,7 +107,7 @@ tr.drop-row{opacity:.45}
       </div>
       <div class="row">
         <label class="opt"><input id="optRenum" type="checkbox" checked> <span>남긴 문항 앞에 <b>1번부터 새 번호</b> 달기 (맨 뒤 정답 번호도 자동 연동)</span></label>
-        <label class="opt"><input id="optReflow" type="checkbox" checked> <span><b>빈 쪽·반쪽 정리</b>: 남긴 문항 사이의 쪽/단 나누기를 없애 앞으로 당기고, 문제와 선지가 한 쪽에 같이 오도록 묶기</span></label>
+        <label class="opt"><input id="optReflow" type="checkbox" checked> <span><b>빈 쪽·반쪽 정리</b>: 남긴 문항 사이의 쪽/단 나누기를 없애 앞으로 당기고, 문제와 선지는 붙여 두며, 문제가 여러 개인 지문은 한 쪽에 맞추기(필요하면 문항 사이 빈 줄을 조금 줄임)</span></label>
       </div>
     </section>
 
@@ -2593,33 +2593,318 @@ if(typeof require !== 'undefined' && typeof module !== 'undefined' && typeof DO_
     };
   }
 
-  function planLayout(parsed, sel, cloner) {
-    let unit = [];
-    let seenStem = false;
-    const flush = () => {
-      if (unit.length && cloner && cloner.ok) {
-        const protectedAlready = unit.some((q) => cloner.attr(q.psId) & KEEP_NEXT);
-        if (!protectedAlready) unit.forEach((q, i) => (q.mod.add |= i < unit.length - 1 ? KEEP_NEXT | KEEP_LINES : KEEP_LINES));
-      }
-      unit = [];
-      seenStem = false;
-    };
-    for (const sec of parsed.sections)
+  /* ----- 줄 배치 정보(원본 한글이 계산해 둔 LINE_SEG)로 쪽 넘침을 미리 계산 ----- */
+  const TAG_PAGE_DEF = 73;
+  const LABEL_MARGIN = 400; // 시뮬레이션 여유(약 한 줄 간격)
+  // 글자 폭 추정(단위: 글자 크기). 발문 앞에 번호를 붙였을 때 줄이 늘어나는지 가늠하는 용도
+  function charUnit(c) {
+    if (c >= 0x2460 && c <= 0x24ff) return 1;
+    if (c >= 0x1100) return 1;
+    if (c === 32) return 0.35;
+    if (c >= 48 && c <= 57) return 0.55;
+    if (c >= 65 && c <= 90) return 0.62;
+    if (c >= 97 && c <= 122) return 0.5;
+    return 0.4;
+  }
+
+  function ensureGeometry(parsed) {
+    if (parsed.geoDone) return;
+    parsed.geoDone = true;
+    const bucket = new Map();
+    for (const sec of parsed.sections) {
+      const dv = new DataView(sec.data.buffer, sec.data.byteOffset, sec.data.byteLength);
+      let maxYh = 0;
       for (const p of sec.paras) {
-        p.mod = { clear: false, add: 0 };
+        p.L = [];
+        for (let k = p.startRec + 1; k < p.endRec; k++) {
+          const r = sec.recs[k];
+          if (r.tag === 69 && r.level === 1) {
+            for (let o = r.dataStart; o + 36 <= r.end; o += 36) p.L.push({ chpos: dv.getUint32(o, true), y: dv.getInt32(o + 4, true), h: dv.getInt32(o + 8, true), ls: dv.getInt32(o + 20, true), w: dv.getInt32(o + 28, true) });
+            break;
+          }
+        }
+        for (const l of p.L) maxYh = Math.max(maxYh, l.y + l.h);
+        // 줄별 글자 폭 합(단위폭): 두 줄 이상이거나 발문인 문단만
+        p.U = null;
+        const tr = sec.recs[p.startRec + 1];
+        if (p.L.length && tr && tr.tag === TAG_PARA_TEXT && tr.level === 1 && (p.L.length >= 2 || p.has17)) {
+          const arr = [];
+          let i = tr.dataStart;
+          let pos = 0;
+          while (i + 1 < tr.end) {
+            const c = sec.data[i] | (sec.data[i + 1] << 8);
+            if (c >= 32) arr[pos++] = charUnit(c), (i += 2);
+            else if (c === 0 || c === 10 || c === 13 || (c >= 24 && c <= 31)) arr[pos++] = 0, (i += 2);
+            else {
+              for (let q = 0; q < 8; q++) arr[pos++] = 0;
+              i += 16;
+            }
+          }
+          p.U = p.L.map((l, j) => {
+            const e = j + 1 < p.L.length ? p.L[j + 1].chpos : pos;
+            let u = 0;
+            for (let q = l.chpos; q < e; q++) u += arr[q] || 0;
+            return u;
+          });
+          p.L.forEach((l, j) => {
+            if (j < p.L.length - 1 && p.U[j] > 8) {
+              if (!bucket.has(l.w)) bucket.set(l.w, []);
+              bucket.get(l.w).push(p.U[j]);
+            }
+          });
+        }
+      }
+      // 문단별 세로 진행량(advance): 같은 단 안에서 다음 줄/문단과의 y 차이
+      sec.paras.forEach((p, i) => {
+        p.adv = [];
+        for (let j = 0; j < p.L.length; j++) {
+          const l = p.L[j];
+          let d = -1;
+          if (j < p.L.length - 1) d = p.L[j + 1].y - l.y;
+          else {
+            const nx = sec.paras[i + 1];
+            const nl = nx && nx.L && nx.L[0];
+            if (nl) d = nl.y - l.y;
+            if (d > l.h + l.ls + 6000) d = -1;
+          }
+          p.adv.push(d > 0 ? d : l.h + l.ls);
+        }
+      });
+      // 구역의 쪽/단 정보
+      sec.geo = null;
+      let cold = 0;
+      let ncols = 1;
+      for (let k = 0; k < sec.recs.length; k++) {
+        const r = sec.recs[k];
+        if (r.tag === 71 && ctrlId(sec.data, r) === 'cold') {
+          if (!cold++) ncols = (dv.getUint16(r.dataStart + 4, true) >> 2) & 0xff || 1;
+        }
+      }
+      const pd = sec.recs.find((r) => r.tag === TAG_PAGE_DEF);
+      if (pd && cold === 1 && pd.end - pd.dataStart >= 40) {
+        const o = pd.dataStart;
+        const attr = dv.getUint32(o + 36, true);
+        const ph = dv.getUint32(o + (attr & 1 ? 0 : 4), true);
+        const body = ph - dv.getUint32(o + 16, true) - dv.getUint32(o + 20, true) - dv.getUint32(o + 24, true) - dv.getUint32(o + 28, true);
+        const C = Math.max(body, maxYh);
+        if (body > 10000 && ncols >= 1 && ncols <= 4) sec.geo = { C, ncols };
+      }
+    }
+    parsed.capByW = new Map();
+    for (const [w, a] of bucket)
+      if (a.length >= 30) {
+        a.sort((x, y) => x - y);
+        parsed.capByW.set(w, a[a.length >> 1]);
+      }
+  }
+
+  // 번호("38. ")를 앞에 붙이면 발문이 몇 줄 늘어나는지(0/1) 추정. 애매하면 늘어난다고 본다(보수적).
+  function labelExtraLines(parsed, p, n) {
+    if (!p.U || !p.L.length) return 0;
+    const last = p.L[p.L.length - 1];
+    const cap = parsed.capByW.get(last.w);
+    if (!cap) return 0;
+    const lu = 0.55 * String(n).length + 0.75;
+    return (p.U[p.U.length - 1] + lu) / cap >= 1.0 ? 1 : 0;
+  }
+
+  // 한 블록 안의 "붙여 둘 묶음": [시작 문단+짧은 머리말] / [발문+선지]. 지문 본문과 빈 줄은 묶지 않는다.
+  function chainGroups(paras, startsBlock) {
+    const gs = [];
+    let i = 0;
+    const n = paras.length;
+    const nonEmpty = (q) => !!q.plain.trim() || q.hasObj;
+    if (startsBlock) {
+      const st = [paras[0]];
+      i = 1;
+      while (i < n && st.length < 3 && nonEmpty(paras[i]) && !paras[i].has17 && paras[i].L.length <= 2) st.push(paras[i++]);
+      gs.push({ ps: st, tie: true });
+    }
+    while (i < n) {
+      const q = paras[i];
+      if (q.has17) {
+        const u = [q];
+        i++;
+        while (i < n && nonEmpty(paras[i]) && !paras[i].has17) u.push(paras[i++]);
+        gs.push({ ps: u, tie: false });
+      } else {
+        gs.push({ ps: [q], single: true });
+        i++;
+      }
+    }
+    return gs;
+  }
+
+  function planLayout(parsed, sel, cloner) {
+    ensureGeometry(parsed);
+    const stats = { pageBreaks: 0, trimmed: 0 };
+    let n = 0; // 남는 발문 수(번호 매기기용)
+    for (const sec of parsed.sections) {
+      for (const p of sec.paras) p.mod = { clear: false, add: 0, page: false, drop: false };
+      // 1) 남는 문단을 "블록 묶음"과 "일반 문단"으로 나눔
+      const items = [];
+      let curB = null;
+      for (const p of sec.paras) {
         const kept = !p.block || p.hasSecd || blockKept(p.block, sel);
         if (!kept) continue;
+        if (p.has17) p.stemNo = ++n;
         if (!p.block || p.hasSecd || p.isAnswerHeading) {
-          flush(); // 구역 시작/문서 앞뒤 문단은 단위 경계
+          items.push({ type: 'p', p });
+          curB = null;
           continue;
         }
-        p.mod.clear = true; // 남는 문항 블록 안의 쪽/단 나누기는 제거
-        if (p.isBlockStart) flush();
-        else if (p.has17 && seenStem) flush();
-        if (p.has17) seenStem = true;
-        unit.push(p);
+        if (p.isBlockStart || !curB || curB.block !== p.block) {
+          curB = { type: 'b', block: p.block, paras: [], startsBlock: !!p.isBlockStart };
+          items.push(curB);
+        }
+        curB.paras.push(p);
+        p.mod.clear = true; // 남는 문항 블록 안의 쪽/단 나누기는 일단 제거
       }
-    flush();
+      // 2) 붙여 둘 묶음에 "다음 문단과 함께/문단 보호" 설정
+      if (cloner && cloner.ok)
+        for (const it of items) {
+          if (it.type !== 'b') continue;
+          for (const g of chainGroups(it.paras, it.startsBlock)) {
+            if (g.single) continue;
+            if (g.ps.some((q) => cloner.attr(q.psId) & KEEP_NEXT)) continue; // 원본이 이미 보호 설정을 가진 묶음
+            g.ps.forEach((q, i) => (q.mod.add |= i < g.ps.length - 1 || g.tie ? KEEP_NEXT | KEEP_LINES : KEEP_LINES));
+          }
+        }
+      // 3) 한 지문(여러 문제) 블록이 한 쪽에 들어가도록 쪽 나누기/빈 줄 조정
+      if (!sec.geo) continue;
+      const trimmed = new Set();
+      const extraOf = (q) => (sel.renumber && q.has17 && q.stemNo ? labelExtraLines(parsed, q, q.stemNo) : 0);
+      const NC = sec.geo.ncols;
+      const page = (c) => Math.floor(c / NC);
+      const st = { col: 0, y: 0 };
+      // 모든 항목을 차례로 배치하면서, 여러 문제가 든 블록은 한 쪽에 맞는지 검사
+      const place = (its, force) => runItems(sec, its, extraOf, trimmed, st, force);
+      for (const it of items) {
+        if (it.type === 'p') {
+          place([it], false);
+          continue;
+        }
+        const multi = it.block.items >= 2; // 문제가 여러 개 딸린 지문은 한 쪽 안에 들어오게 한다 (문제 1개짜리는 빈 반쪽을 채우도록 그대로 이어 붙임)
+        const snap = { col: st.col, y: st.y };
+        let r = place([it], false);
+        if (sel.debug) stats.trace = (stats.trace || []).concat([{ sec: parsed.sections.indexOf(sec), items: it.block.items, paras: it.paras.length, start: [r.startCol, r.startY], end: [r.endCol, r.endY] }]);
+        if (multi && page(r.endCol) !== page(r.startCol)) {
+          // 현재 쪽에 다 못 들어가면 새 쪽에서 시작
+          st.col = snap.col;
+          st.y = snap.y;
+          r = place([it], true);
+          it.paras[0].mod.page = it.startsBlock && !it.paras[0].hasSecd && r.forced;
+          if (page(r.endCol) !== page(r.startCol)) {
+            // 새 쪽에서도 넘치면 빈 줄을 줄여 본다(가장 긴 연속 빈 줄부터, 최소 1줄은 남김)
+            const mine = [];
+            const mark = new Set();
+            for (let guard = 0; guard < 60 && page(r.endCol) !== page(r.startCol); guard++) {
+              const runs = [];
+              let cur = null;
+              for (const q of it.paras) {
+                const trimmable = !q.plain.trim() && !q.hasObj && !q.has17 && !q.hasSecd && q.endRec - q.startRec <= 4 && !mark.has(q);
+                if (trimmable) {
+                  if (cur) cur.push(q);
+                  else runs.push((cur = [q]));
+                } else cur = null;
+              }
+              const cand = runs.filter((x) => x.length >= 2).sort((a, b) => b.length - a.length)[0];
+              if (!cand) break;
+              const q = cand[cand.length - 1];
+              mark.add(q);
+              mine.push(q);
+              trimmed.add(q);
+              st.col = snap.col;
+              st.y = snap.y;
+              r = place([it], true);
+            }
+            if (page(r.endCol) !== page(r.startCol)) {
+              // 줄여도 안 들어가면(지문 자체가 한 쪽보다 큼) 원래대로 둔다
+              for (const q of mine) trimmed.delete(q);
+              st.col = snap.col;
+              st.y = snap.y;
+              r = place([it], true);
+            } else for (const q of mine) q.mod.drop = true;
+          }
+          if (it.paras[0].mod.page) stats.pageBreaks++;
+        }
+      }
+      stats.trimmed += trimmed.size;
+    }
+    return stats;
+  }
+
+  // 항목(들)을 현재 상태 st 에서 배치하고 시작/끝 위치를 돌려줌
+  function runItems(sec, its, extraOf, trimmed, st, force) {
+    const C = sec.geo.C - LABEL_MARGIN;
+    const NC = sec.geo.ncols;
+    const putLine = (h, adv) => {
+      if (st.y > 0 && st.y + h > C) {
+        st.col++;
+        st.y = 0;
+      }
+      st.y += adv;
+    };
+    const lines = (q) => {
+      if (trimmed.has(q)) return;
+      const ex = extraOf(q);
+      const n = q.L.length;
+      for (let j = 0; j < n + ex; j++) {
+        const jj = Math.min(j, n - 1);
+        putLine(q.L[jj].h, q.adv[jj]);
+      }
+    };
+    const need = (g, nextPara) => {
+      let H = 0;
+      let lastH = 0;
+      let lastAdv = 0;
+      for (const q of g.ps) {
+        if (trimmed.has(q)) continue;
+        const ex = extraOf(q);
+        const n = q.L.length;
+        for (let j = 0; j < n + ex; j++) {
+          const jj = Math.min(j, n - 1);
+          H += q.adv[jj];
+          lastH = q.L[jj].h;
+          lastAdv = q.adv[jj];
+        }
+      }
+      let nd = H - (lastAdv - lastH);
+      if (g.tie && nextPara && nextPara.L.length) nd += nextPara.adv[0];
+      return nd;
+    };
+    let startCol = st.col;
+    let startY = st.y;
+    let forced = false;
+    for (const it of its) {
+      if (it.type === 'p') {
+        lines(it.p);
+        continue;
+      }
+      if (force && (st.y > 0 || st.col % NC !== 0)) {
+        st.col = (Math.floor(st.col / NC) + 1) * NC;
+        st.y = 0;
+        forced = true;
+      }
+      startCol = st.col;
+      startY = st.y;
+      const paras = it.paras.filter((q) => !trimmed.has(q));
+      const gs = chainGroups(paras, it.startsBlock);
+      for (let gi = 0; gi < gs.length; gi++) {
+        const g = gs[gi];
+        if (g.single) {
+          lines(g.ps[0]);
+          continue;
+        }
+        const nd = need(g, gs[gi + 1] && gs[gi + 1].ps[0]);
+        if (st.y > 0 && st.y + nd > C) {
+          st.col++;
+          st.y = 0;
+        }
+        for (const q of g.ps) lines(q);
+      }
+    }
+    return { startCol, startY, endCol: st.col, endY: st.y, forced };
   }
 
   // 구역 정의(secd)를 품은 문단은 삭제할 수 없어 남지만, 그 안의 "┃9월 21번┃" 같은 태그 글자는
@@ -2644,7 +2929,7 @@ if(typeof require !== 'undefined' && typeof module !== 'undefined' && typeof DO_
 
   async function buildSection(section, sel, compressed, ctx, cloner) {
     const { data, recs, paras } = section;
-    const keep = paras.map((p) => !p.block || p.hasSecd || blockKept(p.block, sel));
+    const keep = paras.map((p) => (!p.block || p.hasSecd || blockKept(p.block, sel)) && !(p.mod && p.mod.drop));
     const chunks = [];
     const firstStart = paras.length ? recs[paras[0].startRec].start : data.length;
     chunks.push(data.subarray(0, firstStart));
@@ -2661,10 +2946,11 @@ if(typeof require !== 'undefined' && typeof module !== 'undefined' && typeof DO_
         ctx.n++;
         chunk = rewriteStem(data, recs, p, ctx.n, sel.renumber ? ctx.n + '. ' : '');
       }
-      if (p.mod && (p.mod.clear || p.mod.add)) {
+      if (p.mod && (p.mod.clear || p.mod.add || p.mod.page)) {
         chunk = Uint8Array.from(chunk);
         const ho = recs[p.startRec].dataStart - s;
         if (p.mod.clear) chunk[ho + 11] &= ~BRK_PAGE_COL;
+        if (p.mod.page) chunk[ho + 11] |= 0x04; // 지문 블록은 새 쪽에서 시작
         if (p.mod.add && cloner) {
           const cdv = new DataView(chunk.buffer, chunk.byteOffset, chunk.byteLength);
           cdv.setUint16(ho + 8, cloner.get(cdv.getUint16(ho + 8, true), p.mod.add), true);
@@ -2730,7 +3016,8 @@ if(typeof require !== 'undefined' && typeof module !== 'undefined' && typeof DO_
     const ctx = { n: 0 };
     const di = readDocInfo(parsed);
     const cloner = sel.reflow !== false && di ? makeParaShapeCloner(di.data, di.recs) : null;
-    if (sel.reflow !== false) planLayout(parsed, sel, cloner);
+    let layout = null;
+    if (sel.reflow !== false) layout = planLayout(parsed, sel, cloner);
     else for (const sec of parsed.sections) for (const p of sec.paras) p.mod = null;
     for (const s of parsed.sections) {
       const r = await buildSection(s, sel, parsed.compressed, ctx, cloner);
@@ -2749,7 +3036,7 @@ if(typeof require !== 'undefined' && typeof module !== 'undefined' && typeof DO_
       }
     }
     const out = CFB.write(cfb, { type: 'array' });
-    return { bytes: Uint8Array.from(out), keptParas, totalParas, stats: countKept(parsed, sel), clones: cloner ? cloner.clones.length : 0 };
+    return { bytes: Uint8Array.from(out), keptParas, totalParas, stats: countKept(parsed, sel), clones: cloner ? cloner.clones.length : 0, layout };
   }
 
   // PDF 출력용: 남기는 문단의 텍스트 목록 (그림/표는 자리표시만)
@@ -3106,7 +3393,8 @@ if(typeof require !== 'undefined' && typeof module !== 'undefined' && typeof DO_
       a.remove();
       setTimeout(() => URL.revokeObjectURL(url), 60000);
       st.className = 'status ok';
-      st.textContent = '완료: ' + r.stats.items + '문항을 남기고 ' + (state.parsed.totalItems - r.stats.items) + '문항을 삭제했습니다. (' + fmtSize(r.bytes.length) + ') → ' + base + '_추출.hwp';
+      const lay = r.layout && (r.layout.pageBreaks || r.layout.trimmed) ? ' · 쪽 정리: 문제가 여러 개인 지문 ' + r.layout.pageBreaks + '개를 새 쪽에서 시작' + (r.layout.trimmed ? ', 한 쪽에 맞추려고 문항 사이 빈 줄 ' + r.layout.trimmed + '개 줄임' : '') : '';
+      st.textContent = '완료: ' + r.stats.items + '문항을 남기고 ' + (state.parsed.totalItems - r.stats.items) + '문항을 삭제했습니다. (' + fmtSize(r.bytes.length) + ') → ' + base + '_추출.hwp' + lay;
     } catch (e) {
       st.className = 'status err';
       st.textContent = '저장 중 오류: ' + (e.message || e);
