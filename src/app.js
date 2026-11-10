@@ -49,7 +49,7 @@
       const buf = new Uint8Array(await file.arrayBuffer());
       await new Promise((r) => setTimeout(r, 20)); // 화면 갱신
       const parsed = await HwpFilter.parseHwp(buf);
-      if (!parsed.blocks.length) throw new Error('문항 태그(예: [25년 10월 19번])를 찾지 못했습니다. 이 파일은 번호로 문항을 구분할 수 없습니다.');
+      if (!parsed.blocks.length) throw new Error('문항 태그(예: [25년 10월 19번] 또는 ┃9월 18번┃)를 찾지 못했습니다. 이 파일은 번호로 문항을 구분할 수 없습니다.');
       state.parsed = parsed;
       state.fileName = file.name;
       state.selNums = new Set();

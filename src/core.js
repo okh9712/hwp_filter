@@ -4,7 +4,7 @@
  *
  * 동작 요약
  *  1) OLE 컨테이너를 읽고 BodyText/SectionN 을 압축 해제
- *  2) 최상위 문단을 "[25년 10월 19번]" 같은 태그 기준으로 문항 블록으로 묶음
+ *  2) 최상위 문단을 "[25년 10월 19번]" 또는 "┃9월 18번┃" 같은 태그 기준으로 문항 블록으로 묶음
  *     - 태그 없는 후속 문항("윗글의 ...")은 직전 블록에 귀속
  *  3) 선택되지 않은 블록의 레코드를 통째로 제거하고 다시 압축/저장
  */
@@ -107,12 +107,17 @@
   }
 
   /* ---------- 태그 해석 ---------- */
-  // "[25년 10월 41번~42번]", "[25년 10월 23번 변형]", "[학교프린트]" ...
-  function parseTrailingTag(plain) {
-    const t = plain.replace(/[\s\u0011]+$/, '');
-    const m = /\[([^\[\]]*)\]$/.exec(t);
-    if (!m) return null;
-    const inner = m[1];
+  // 지원 형식
+  //  1) 문단 맨 끝의 대괄호 태그: "[25년 10월 41번~42번]", "[25년 10월 23번 변형]", "[학교프린트]" ...
+  //  2) 문단 맨 끝의 세로선 태그: "┃9월 18번┃" (┃ │ | ｜ 허용, 번호가 있을 때만 태그로 인정)
+  //  3) 글상자/표 같은 개체 안에 들어 있는 세로선 태그(문항 앞에 박스로 붙은 "┃9월 18번┃")
+  const BAR = '┃│|｜';
+  const TAIL_RE = new RegExp('(?:\\[([^\\[\\]]*)\\]|[' + BAR + ']([^' + BAR + ']*)[' + BAR + '])$');
+  const TAIL_STRIP_RE = new RegExp('(?:\\[[^\\[\\]]*\\]|[' + BAR + '][^' + BAR + ']*[' + BAR + '])\\s*$');
+  const BOX_RE = new RegExp('^[' + BAR + ']([^' + BAR + ']*)[' + BAR + ']$');
+
+  // 태그 안쪽 문자열("9월 18번", "25년 10월 41번~42번", "학교프린트")을 해석
+  function interpretTag(inner, isBar) {
     const s = inner.replace(/\d+\s*년/g, ' ').replace(/\d+\s*월/g, ' ');
     const variant = /변형/.test(s);
     const nums = new Set();
@@ -127,9 +132,25 @@
       return ' ';
     });
     if (nums.size) return { nums: [...nums].sort((a, b) => a - b), variant, label: null, raw: inner };
+    if (isBar) return null; // 세로선 태그는 번호가 있을 때만 인정 (본문 속 | 오인식 방지)
     const label = inner.trim();
     if (!label || /^\d+\s*점$/.test(label)) return null;
     return { nums: [], variant: false, label, raw: inner };
+  }
+
+  function parseTrailingTag(plain) {
+    const t = plain.replace(/[\s\u0011]+$/, '');
+    const m = TAIL_RE.exec(t);
+    if (!m) return null;
+    const isBar = m[1] === undefined;
+    return interpretTag(isBar ? m[2] : m[1], isBar);
+  }
+
+  // 개체 안의 문단 텍스트가 "┃9월 18번┃" 전체와 일치할 때만 태그로 인정
+  function parseBoxTag(text) {
+    const t = text.replace(/[\s\u0011]+/g, ' ').trim();
+    const m = BOX_RE.exec(t);
+    return m ? interpretTag(m[1], true) : null;
   }
 
   /* ---------- 파싱 ---------- */
@@ -182,6 +203,20 @@
         if (next && next.tag === TAG_PARA_TEXT && next.level === 1) {
           Object.assign(p, parseParaText(data, next.dataStart, next.end));
         }
+        // 본문이 비어 있고 개체(글상자) 안에 "┃9월 18번┃" 만 들어 있는 문단 → 문항 시작 태그
+        p.boxTag = null;
+        if (!p.plain.trim() && !p.has17) {
+          for (let k = p.startRec + 1; k < p.endRec; k++) {
+            const r = recs[k];
+            if (r.tag !== TAG_PARA_TEXT || r.level < 2) continue;
+            const bt = parseBoxTag(parseParaText(data, r.dataStart, r.end).plain);
+            if (bt) {
+              p.boxTag = bt;
+              p.boxTagRec = k;
+              break;
+            }
+          }
+        }
         // 발문 끝 미주(en) 안의 정답 텍스트
         p.answer = '';
         if (p.has17) {
@@ -220,16 +255,18 @@
           paraSeq++;
           continue;
         }
-        const t = parseTrailingTag(p.plain);
+        const t = parseTrailingTag(p.plain) || p.boxTag;
         const isStart = t && (t.nums.length || labelSet.has(t.label));
         if (isStart) {
           cur = { id: blocks.length, nums: t.nums, variant: t.variant, label: t.label, raw: t.raw, items: 0, paras: 0, firstPara: paraSeq, title: '' };
           blocks.push(cur);
-          cur.title = p.plain.replace(/\u0011/g, '').replace(/\[[^\[\]]*\]\s*$/, '').trim().slice(0, 60);
+          cur.title = p.plain.replace(/\u0011/g, '').replace(TAIL_STRIP_RE, '').trim().slice(0, 60);
         } else if (!cur && p.has17) {
           cur = { id: blocks.length, nums: [], variant: false, label: '태그 없음', raw: '', items: 0, paras: 0, firstPara: paraSeq, title: p.plain.replace(/\u0011/g, '').trim().slice(0, 60) };
           blocks.push(cur);
         }
+        // 제목: 태그가 글상자라 제목이 비어 있으면 블록의 첫 본문 문단으로 채움
+        if (cur && !cur.title && p.plain.trim()) cur.title = p.plain.replace(/\u0011/g, '').trim().slice(0, 60);
         p.block = cur;
         if (cur) {
           cur.paras++;
@@ -369,6 +406,26 @@
     return concat(parts);
   }
 
+  // 구역 정의(secd)를 품은 문단은 삭제할 수 없어 남지만, 그 안의 "┃9월 21번┃" 같은 태그 글자는
+  // 삭제된 문항의 흔적이므로 같은 길이의 공백으로 바꿔 지운다. (레코드 크기/위치 정보는 그대로 유지)
+  function blankBoxTag(data, recs, p, chunk, chunkStart) {
+    const r = recs[p.boxTagRec];
+    const out = Uint8Array.from(chunk);
+    const base = r.dataStart - chunkStart;
+    let i = 0;
+    const len = r.end - r.dataStart;
+    while (i + 1 < len) {
+      const c = out[base + i] | (out[base + i + 1] << 8);
+      if (c >= 32) {
+        out[base + i] = 0x20;
+        out[base + i + 1] = 0;
+        i += 2;
+      } else if (c === 0 || c === 10 || c === 13 || (c >= 24 && c <= 31)) i += 2;
+      else i += 16;
+    }
+    return out;
+  }
+
   async function buildSection(section, sel, compressed, ctx) {
     const { data, recs, paras } = section;
     const keep = paras.map((p) => !p.block || p.hasSecd || blockKept(p.block, sel));
@@ -383,6 +440,7 @@
       const s = recs[p.startRec].start;
       const e = p.endRec < recs.length ? recs[p.endRec].start : data.length;
       let chunk = data.subarray(s, e);
+      if (p.boxTag && p.block && !blockKept(p.block, sel)) chunk = blankBoxTag(data, recs, p, chunk, s);
       if (p.has17) {
         ctx.n++;
         chunk = rewriteStem(data, recs, p, ctx.n, sel.renumber ? ctx.n + '. ' : '');
@@ -462,13 +520,13 @@
         if (!p.block && !p.plain.trim() && !p.hasObj) continue;
         const no = p.has17 ? ++n : 0;
         out.push({
-          text: (no && sel.renumber ? no + '. ' : '') + p.plain.replace(/\u0011/g, '').replace(/\s+$/, ''),
+          text: p.boxTag ? '┃' + p.boxTag.raw.trim() + '┃' : (no && sel.renumber ? no + '. ' : '') + p.plain.replace(/\u0011/g, '').replace(/\s+$/, ''),
           no,
           answer: p.answer,
           heading: !!p.isAnswerHeading,
           stem: p.has17,
-          start: !!(p.block && /\[[^\[\]]*\]\s*$/.test(p.plain.replace(/[\u0011\s]+$/, '')) && parseTrailingTag(p.plain)),
-          obj: p.hasObj,
+          start: !!(p.block && (p.boxTag || parseTrailingTag(p.plain))),
+          obj: p.hasObj && !p.boxTag,
         });
       }
     return out;
