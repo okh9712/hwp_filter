@@ -1,7 +1,7 @@
 (function () {
   'use strict';
   const $ = (id) => document.getElementById(id);
-  const state = { parsed: null, fileName: '', selNums: new Set(), selLabels: new Set(), includeVariant: true, renumber: true };
+  const state = { parsed: null, fileName: '', selNums: new Set(), selLabels: new Set(), includeVariant: true, renumber: true, reflow: true };
 
   const fmtSize = (n) => (n >= 1048576 ? (n / 1048576).toFixed(2) + ' MB' : Math.round(n / 1024) + ' KB');
 
@@ -187,7 +187,10 @@
   });
 
   /* ---------- 요약/목록 ---------- */
-  const sel = () => ({ nums: state.selNums, labels: state.selLabels, includeVariant: state.includeVariant, renumber: state.renumber });
+  const sel = () => ({ nums: state.selNums, labels: state.selLabels, includeVariant: state.includeVariant, renumber: state.renumber, reflow: state.reflow });
+  $('optReflow').addEventListener('change', (e) => {
+    state.reflow = e.target.checked;
+  });
   $('optRenum').addEventListener('change', (e) => {
     state.renumber = e.target.checked;
     refresh();

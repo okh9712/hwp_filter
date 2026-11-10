@@ -14,6 +14,11 @@
   const TAG_PARA_HEADER = 66;
   const TAG_PARA_TEXT = 67;
   const TAG_DOC_PROPERTIES = 16;
+  const TAG_ID_MAPPINGS = 17;
+  const TAG_PARA_SHAPE = 25;
+  const KEEP_NEXT = 1 << 17; // 문단 모양: 다음 문단과 함께
+  const KEEP_LINES = 1 << 18; // 문단 모양: 문단 보호(쪽/단 사이에서 쪼개지지 않음)
+  const BRK_PAGE_COL = 0x0c; // 문단 헤더 나누기 종류: 0x04 쪽 나누기, 0x08 단 나누기
 
   /* ---------- 압축 ---------- */
   // 이 파일의 압축 스트림은 raw deflate 뒤에 CRC32(4)+원본크기(4) 8바이트가 붙어 있다.
@@ -179,6 +184,10 @@
       .map((x) => x.p.replace(/^Root Entry/, ''));
     if (!secPaths.length) throw new Error('본문(BodyText) 섹션을 찾지 못했습니다.');
 
+    // DocInfo 원본 보관 (저장을 여러 번 해도 항상 원본에서 시작하도록)
+    const diEntry = CFB.find(cfb, '/DocInfo');
+    const docInfoRaw = diEntry ? Uint8Array.from(diEntry.content) : null;
+
     const sections = [];
     for (const path of secPaths) {
       const entry = CFB.find(cfb, path);
@@ -198,7 +207,9 @@
           paras.push({ startRec: k, endRec: recs.length, plain: '', has17: false, hasSecd: false, block: null });
         }
       }
+      const sdv = new DataView(data.buffer, data.byteOffset, data.byteLength);
       for (const p of paras) {
+        p.psId = sdv.getUint16(recs[p.startRec].dataStart + 8, true); // 문단 모양 id
         const next = recs[p.startRec + 1];
         if (next && next.tag === TAG_PARA_TEXT && next.level === 1) {
           Object.assign(p, parseParaText(data, next.dataStart, next.end));
@@ -260,10 +271,12 @@
         if (isStart) {
           cur = { id: blocks.length, nums: t.nums, variant: t.variant, label: t.label, raw: t.raw, items: 0, paras: 0, firstPara: paraSeq, title: '' };
           blocks.push(cur);
+          p.isBlockStart = true;
           cur.title = p.plain.replace(/\u0011/g, '').replace(TAIL_STRIP_RE, '').trim().slice(0, 60);
         } else if (!cur && p.has17) {
           cur = { id: blocks.length, nums: [], variant: false, label: '태그 없음', raw: '', items: 0, paras: 0, firstPara: paraSeq, title: p.plain.replace(/\u0011/g, '').trim().slice(0, 60) };
           blocks.push(cur);
+          p.isBlockStart = true;
         }
         // 제목: 태그가 글상자라 제목이 비어 있으면 블록의 첫 본문 문단으로 채움
         if (cur && !cur.title && p.plain.trim()) cur.title = p.plain.replace(/\u0011/g, '').trim().slice(0, 60);
@@ -298,6 +311,7 @@
     return {
       cfb,
       compressed,
+      docInfoRaw,
       sections,
       blocks,
       totalItems,
@@ -406,6 +420,73 @@
     return concat(parts);
   }
 
+  /* ---------- 쪽/단 정리 ---------- */
+  // 문항을 지우면 (1) 문항마다 걸려 있던 "쪽 나누기/단 나누기"가 그대로 남아 빈 쪽·반쪽이 생기고
+  // (2) 문제와 선지가 쪽 경계에서 갈라질 수 있다. 그래서
+  //  - 남는 문항 블록의 문단에서 쪽 나누기/단 나누기를 제거(구역 시작 문단은 유지)하고
+  //  - 문항 단위(발문+선지, 첫 단위는 지문 포함)의 문단에 "다음 문단과 함께/문단 보호"를 걸어 붙여 둔다.
+  //    (원본 문서가 이미 보호 설정을 가진 단위는 손대지 않는다)
+  function makeParaShapeCloner(data, recs) {
+    const list = recs.filter((r) => r.tag === TAG_PARA_SHAPE);
+    const idm = recs.find((r) => r.tag === TAG_ID_MAPPINGS);
+    const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+    // 안전장치: ID 매핑 표의 문단 모양 개수와 실제 레코드 수가 같을 때만 복제를 허용
+    const ok = !!idm && idm.end - idm.dataStart >= 14 * 4 && dv.getUint32(idm.dataStart + 13 * 4, true) === list.length && list.length > 0;
+    const clones = [];
+    const map = new Map();
+    return {
+      ok,
+      list,
+      idm,
+      clones,
+      attr: (id) => (ok && id < list.length ? dv.getUint32(list[id].dataStart, true) : 0),
+      get(id, add) {
+        if (!ok || id >= list.length) return id;
+        const attr = dv.getUint32(list[id].dataStart, true);
+        const na = (attr | add) >>> 0;
+        if (na === attr) return id;
+        const key = id + ':' + add;
+        if (map.has(key)) return map.get(key);
+        const nid = list.length + clones.length;
+        if (nid > 0xffff) return id;
+        const body = Uint8Array.from(data.subarray(list[id].dataStart, list[id].end));
+        new DataView(body.buffer).setUint32(0, na, true);
+        clones.push(body);
+        map.set(key, nid);
+        return nid;
+      },
+    };
+  }
+
+  function planLayout(parsed, sel, cloner) {
+    let unit = [];
+    let seenStem = false;
+    const flush = () => {
+      if (unit.length && cloner && cloner.ok) {
+        const protectedAlready = unit.some((q) => cloner.attr(q.psId) & KEEP_NEXT);
+        if (!protectedAlready) unit.forEach((q, i) => (q.mod.add |= i < unit.length - 1 ? KEEP_NEXT | KEEP_LINES : KEEP_LINES));
+      }
+      unit = [];
+      seenStem = false;
+    };
+    for (const sec of parsed.sections)
+      for (const p of sec.paras) {
+        p.mod = { clear: false, add: 0 };
+        const kept = !p.block || p.hasSecd || blockKept(p.block, sel);
+        if (!kept) continue;
+        if (!p.block || p.hasSecd || p.isAnswerHeading) {
+          flush(); // 구역 시작/문서 앞뒤 문단은 단위 경계
+          continue;
+        }
+        p.mod.clear = true; // 남는 문항 블록 안의 쪽/단 나누기는 제거
+        if (p.isBlockStart) flush();
+        else if (p.has17 && seenStem) flush();
+        if (p.has17) seenStem = true;
+        unit.push(p);
+      }
+    flush();
+  }
+
   // 구역 정의(secd)를 품은 문단은 삭제할 수 없어 남지만, 그 안의 "┃9월 21번┃" 같은 태그 글자는
   // 삭제된 문항의 흔적이므로 같은 길이의 공백으로 바꿔 지운다. (레코드 크기/위치 정보는 그대로 유지)
   function blankBoxTag(data, recs, p, chunk, chunkStart) {
@@ -426,7 +507,7 @@
     return out;
   }
 
-  async function buildSection(section, sel, compressed, ctx) {
+  async function buildSection(section, sel, compressed, ctx, cloner) {
     const { data, recs, paras } = section;
     const keep = paras.map((p) => !p.block || p.hasSecd || blockKept(p.block, sel));
     const chunks = [];
@@ -444,6 +525,15 @@
       if (p.has17) {
         ctx.n++;
         chunk = rewriteStem(data, recs, p, ctx.n, sel.renumber ? ctx.n + '. ' : '');
+      }
+      if (p.mod && (p.mod.clear || p.mod.add)) {
+        chunk = Uint8Array.from(chunk);
+        const ho = recs[p.startRec].dataStart - s;
+        if (p.mod.clear) chunk[ho + 11] &= ~BRK_PAGE_COL;
+        if (p.mod.add && cloner) {
+          const cdv = new DataView(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+          cdv.setUint16(ho + 8, cloner.get(cdv.getUint16(ho + 8, true), p.mod.add), true);
+        }
       }
       if (p.isAnswerHeading) {
         // 정답 제목 문단은 항상 새 쪽에서 시작 (문단 헤더의 나누기 종류 bit2 = 쪽 나누기)
@@ -465,22 +555,35 @@
     return { bytes: compressed ? deflateRaw(out, section.trailer) : out, keptParas: keep.filter(Boolean).length, totalParas: paras.length };
   }
 
-  async function patchDocInfo(cfb, compressed) {
-    const entry = CFB.find(cfb, '/DocInfo');
-    if (!entry) return;
-    let data = Uint8Array.from(entry.content);
+  function readDocInfo(parsed) {
+    if (!parsed.docInfoRaw) return null;
+    let data = Uint8Array.from(parsed.docInfoRaw);
     let trailer = false;
-    if (compressed) {
+    if (parsed.compressed) {
       const r = inflateRaw(data);
       data = r.out;
       trailer = r.hasTrailer;
     }
-    const recs = scanRecords(data);
+    return { data, trailer, recs: scanRecords(data) };
+  }
+
+  async function patchDocInfo(cfb, compressed, di, cloner) {
+    if (!di) return;
+    let { data } = di;
+    const { trailer, recs } = di;
     const r = recs.find((x) => x.tag === TAG_DOC_PROPERTIES);
     if (r && r.end - r.dataStart >= 26) {
       // 캐럿 위치(리스트/문단/글자 위치)를 문서 처음으로 초기화 (삭제된 문단을 가리키지 않도록)
       data.fill(0, r.dataStart + 14, r.dataStart + 26);
     }
+    if (cloner && cloner.ok && cloner.clones.length) {
+      // 문단 모양 복제본을 기존 문단 모양 목록 바로 뒤에 추가하고 ID 매핑의 개수를 갱신
+      const last = cloner.list[cloner.list.length - 1];
+      const lastRec = recs.find((x) => x.dataStart === last.dataStart);
+      new DataView(data.buffer, data.byteOffset, data.byteLength).setUint32(cloner.idm.dataStart + 13 * 4, cloner.list.length + cloner.clones.length, true);
+      data = concat([data.subarray(0, lastRec.end), ...cloner.clones.map((b) => mkRec(TAG_PARA_SHAPE, lastRec.level, b)), data.subarray(lastRec.end)]);
+    }
+    const entry = CFB.find(cfb, '/DocInfo');
     entry.content = compressed ? deflateRaw(data, trailer) : data;
     entry.size = entry.content.length;
   }
@@ -490,15 +593,19 @@
     let keptParas = 0;
     let totalParas = 0;
     const ctx = { n: 0 };
+    const di = readDocInfo(parsed);
+    const cloner = sel.reflow !== false && di ? makeParaShapeCloner(di.data, di.recs) : null;
+    if (sel.reflow !== false) planLayout(parsed, sel, cloner);
+    else for (const sec of parsed.sections) for (const p of sec.paras) p.mod = null;
     for (const s of parsed.sections) {
-      const r = await buildSection(s, sel, parsed.compressed, ctx);
+      const r = await buildSection(s, sel, parsed.compressed, ctx, cloner);
       const entry = CFB.find(cfb, s.path);
       entry.content = r.bytes;
       entry.size = r.bytes.length;
       keptParas += r.keptParas;
       totalParas += r.totalParas;
     }
-    await patchDocInfo(cfb, parsed.compressed);
+    await patchDocInfo(cfb, parsed.compressed, di, cloner);
     // cfb 라이브러리가 끼워 넣는 자체 표식 스트림은 HWP 에 불필요하므로 제거
     for (let i = cfb.FullPaths.length - 1; i > 0; i--) {
       if (cfb.FileIndex[i].name === '\u0001Sh33tJ5') {
@@ -507,7 +614,7 @@
       }
     }
     const out = CFB.write(cfb, { type: 'array' });
-    return { bytes: Uint8Array.from(out), keptParas, totalParas, stats: countKept(parsed, sel) };
+    return { bytes: Uint8Array.from(out), keptParas, totalParas, stats: countKept(parsed, sel), clones: cloner ? cloner.clones.length : 0 };
   }
 
   // PDF 출력용: 남기는 문단의 텍스트 목록 (그림/표는 자리표시만)
