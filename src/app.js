@@ -327,7 +327,8 @@
       a.remove();
       setTimeout(() => URL.revokeObjectURL(url), 60000);
       st.className = 'status ok';
-      st.textContent = '완료: ' + r.stats.items + '문항을 남기고 ' + (state.parsed.totalItems - r.stats.items) + '문항을 삭제했습니다. (' + fmtSize(r.bytes.length) + ') → ' + base + '_추출.hwp';
+      const lay = r.layout && (r.layout.pageBreaks || r.layout.trimmed) ? ' · 쪽 정리: 문제가 여러 개인 지문 ' + r.layout.pageBreaks + '개를 새 쪽에서 시작' + (r.layout.trimmed ? ', 한 쪽에 맞추려고 문항 사이 빈 줄 ' + r.layout.trimmed + '개 줄임' : '') : '';
+      st.textContent = '완료: ' + r.stats.items + '문항을 남기고 ' + (state.parsed.totalItems - r.stats.items) + '문항을 삭제했습니다. (' + fmtSize(r.bytes.length) + ') → ' + base + '_추출.hwp' + lay;
     } catch (e) {
       st.className = 'status err';
       st.textContent = '저장 중 오류: ' + (e.message || e);
